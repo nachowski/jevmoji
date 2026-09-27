@@ -23,14 +23,19 @@
                 opacity: 0; transition: opacity .2s; }
   .loading .bar::after { opacity: 1; animation: sweep 1s ease-in-out infinite; }
   @keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(430%); } }
+  /* streaming: a solid fill for the share of Jev requests already in (--progress = 0..1) */
+  .bar::before { content: ""; position: absolute; left: 0; bottom: -1px; height: 2px; width: 100%;
+                 background: #7fbf6a55; transform-origin: left; transform: scaleX(var(--progress, 0));
+                 opacity: 0; transition: opacity .4s; }
+  .loading .bar::before { opacity: 1; transition: transform .3s ease, opacity .4s; }
 
   .body { padding: 0 20px; display: grid; grid-template-rows: 0fr; transition: grid-template-rows .3s ease, padding .3s; }
   .body.open { grid-template-rows: 1fr; padding: 14px 20px 18px; }
   .grid { display: flex; flex-wrap: wrap; gap: 2px; overflow: hidden; transition: opacity .2s; }
-  .loading .grid { opacity: .35; }
+  .loading:not(.streaming) .grid { opacity: .35; }  /* dim stale hits until this query's first chunk lands */
   .grid button { font-size: 32px; width: 52px; height: 52px; border: 0; border-radius: 10px; background: none;
-                 cursor: pointer; animation: pop .28s cubic-bezier(.3,1.5,.6,1) backwards;
-                 transition: background .15s, transform .15s; }
+                 cursor: pointer; transition: background .15s, transform .15s; }
+  .grid button.new { animation: pop .28s cubic-bezier(.3,1.5,.6,1) backwards; }
   .grid button:hover, .grid button:first-child { background: #2e3a2a; }
   .grid button:active { transform: scale(.88); }
   .grid button.copied { animation: bump .35s ease; }
@@ -71,24 +76,47 @@ function hidePicked() {
   picked.classList.add("hide");
 }
 
-function render(hits) {
-  grid.replaceChildren();
-  if (!hits.length) grid.innerHTML = '<div class="empty">No match</div>';
-  hits.forEach((h, i) => {
-    const b = document.createElement("button");
-    b.textContent = h.e;
-    b.title = `${h.n} — ${Math.round(h.p * 100)}%`;
-    // 5 buckets across the shown range: 0.5–0.6 → 1 segment … 0.9–1.0 → 5 (server THRESHOLD is 0.5)
-    b.style.setProperty("--lit", Math.min(5, Math.max(1, Math.floor((h.p - 0.5) * 10) + 1)));
-    b.style.animationDelay = `${i * 12}ms`;
-    b.onclick = () => {
-      navigator.clipboard?.writeText(h.e);
-      b.classList.remove("copied"); void b.offsetWidth; b.classList.add("copied");
-      picked.classList.remove("hide");
-      picked.textContent = `Copied ${h.e} ${h.n}`;
-    };
-    grid.append(b);
+function button(h) {
+  const b = document.createElement("button");
+  b.textContent = h.e;
+  b.title = `${h.n} — ${Math.round(h.p * 100)}%`;
+  // 5 buckets across the shown range: 0.5–0.6 → 1 segment … 0.9–1.0 → 5 (server THRESHOLD is 0.5)
+  b.style.setProperty("--lit", Math.min(5, Math.max(1, Math.floor((h.p - 0.5) * 10) + 1)));
+  b.onclick = () => {
+    navigator.clipboard?.writeText(h.e);
+    b.classList.remove("copied"); void b.offsetWidth; b.classList.add("copied");
+    picked.classList.remove("hide");
+    picked.textContent = `Copied ${h.e} ${h.n}`;
+  };
+  return b;
+}
+
+// Keyed re-render: emoji already on screen glide to their new slot (FLIP), newcomers pop in.
+function render(hits, final) {
+  if (!hits.length && !final) return;  // nothing yet; keep waiting for more chunks
+  const old = new Map([...grid.querySelectorAll("button")].map((b) => [b.dataset.e, b]));
+  const before = new Map([...old].map(([e, b]) => [e, b.getBoundingClientRect()]));
+  let fresh = 0;
+  const next = hits.map((h) => {
+    const b = old.get(h.e) ?? button(h);
+    b.dataset.e = h.e;
+    if (!old.has(h.e)) {
+      b.classList.add("new");
+      b.style.animationDelay = `${fresh++ * 12}ms`;
+      b.onanimationend = () => b.classList.remove("new");
+    }
+    return b;
   });
+  grid.replaceChildren(...next);
+  if (!hits.length) grid.innerHTML = '<div class="empty">No match</div>';
+  for (const b of next) {
+    const r = before.get(b.dataset.e);
+    if (!r) continue;
+    const now = b.getBoundingClientRect();
+    const dx = r.left - now.left, dy = r.top - now.top;
+    if (dx || dy) b.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }],
+                            { duration: 320, easing: "cubic-bezier(.3,1.25,.6,1)" });
+  }
   body.classList.add("open");
 }
 
@@ -99,27 +127,46 @@ async function search(query) {
     return;
   }
   controller = new AbortController();
+  picker.classList.remove("streaming");
+  picker.style.setProperty("--progress", 0);
+  void picker.offsetWidth;  // commit the reset before .loading turns the fill's transition on
   picker.classList.add("loading");
   meta.textContent = "";
   const t0 = performance.now();
   try {
     const res = await fetch("/search", { method: "POST", signal: controller.signal,
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query }) });
-    const { hits, tokens, usd } = await res.json();
-    render(hits);
-    meta.textContent = `${Math.round(performance.now() - t0)} ms · $${usd.toFixed(4)}`;
-    meta.title = `${tokens.toLocaleString()} input tokens`;
+    // NDJSON: one line per finished Jev request, each carrying the running top hits
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = "";
+    for (let eof = false; !eof;) {
+      const { value, done } = await reader.read();
+      eof = done;
+      buf += value ?? "";
+      const lines = buf.split("\n");
+      buf = eof ? "" : lines.pop();  // hold back a partial line until the rest arrives
+      for (const line of lines.filter(Boolean)) {
+        const { hits, tokens, usd, done, total } = JSON.parse(line);
+        const final = done === total;
+        render(hits, final);
+        if (hits.length) picker.classList.add("streaming");
+        picker.style.setProperty("--progress", done / total);
+        const ms = Math.round(performance.now() - t0);
+        meta.textContent = final ? `${ms} ms · $${usd.toFixed(4)}` : `${done}/${total} · ${ms} ms`;
+        meta.title = `${tokens.toLocaleString()} input tokens`;
+      }
+    }
   } catch (e) {
     if (e.name === "AbortError") return;
     meta.textContent = "error";
   }
-  picker.classList.remove("loading");
+  picker.classList.remove("loading", "streaming");
 }
 
 q.oninput = () => {
   hidePicked();
   clearTimeout(timer);
-  timer = setTimeout(() => search(q.value), 350);
+  timer = setTimeout(() => search(q.value), 250);
 };
 $("clear").onclick = () => { q.value = ""; hidePicked(); search(""); q.focus(); };
 </script>
